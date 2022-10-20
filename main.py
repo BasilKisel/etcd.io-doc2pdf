@@ -9,6 +9,7 @@ import pathlib
 import tempfile
 import pypandoc
 import re
+import pdfkit
 
 SECTION_SEPARATOR = '\n\n---\n\n'
 INDEX_FILENAME = '_index.md'
@@ -153,9 +154,13 @@ def __main__():
                                   extra_args=['--standalone'])
         if html_filepath:
             print(f'Conversion to pdf "{out_filepath}"')
-            os.system(f'pandoc "{html_filepath}" -o "{out_filepath}" --pdf-engine context')
-            # the line below doesn't work for unknown reasons
-            # pypandoc.convert_file(html_filepath, 'pdf', format='html', outputfile=out_filepath.name, extra_args=['--pdf-engine=context'])
+            pdfkit_options = {
+                'enable-local-file-access': None,
+                'load-media-error-handling': 'skip',
+                'load-error-handling': 'skip',
+                'images': None
+            }
+            pdfkit.from_file(input=html_filepath, output_path=out_filepath, options=pdfkit_options)
             print('Done')
 
 
