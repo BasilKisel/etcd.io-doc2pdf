@@ -1,11 +1,14 @@
-#!python3
+#!/bin/python3
 
 """
 Scraps Markdown doc files from 'etcd website' repository into one markdown file neatly.
 """
-
+import os
 import sys
 import pathlib
+import tempfile
+import pypandoc
+import re
 
 SECTION_SEPARATOR = '\n\n---\n\n'
 INDEX_FILENAME = '_index.md'
@@ -46,17 +49,21 @@ def get_dir_header(dir_path):
     return None, None, None
 
 
-def iterate_directory(dir_path, out_file, section_number, section_separator):
+def iterate_directory(dir_path, tmp_dir, section_number, section_separator):
     """
     Searches for md files recursively. Writes found files into `out_file`.
     :param dir_path: pathlib.Path object pointing to the directory
-    :param out_file: a writable filehandler
+    :param tmp_dir: a temporary directory for TOCs and intermediate files
     :param section_number: a tuple of int to track the section number through subdirectories
     :param section_separator: a separator to be used between to md files
-    :return: none
+    :return: a list of md files to include into conversion
     """
-    toc = list()
-    subdirs = list()
+
+    print(f'Entering dir "{dir_path}"')
+
+    filepath_sequence = []
+    toc = []
+    subdirs = []
     this_title, this_description = None, None
     for child in dir_path.iterdir():
         if child.is_dir():
@@ -68,47 +75,88 @@ def iterate_directory(dir_path, out_file, section_number, section_separator):
             weight, title, description = get_file_header(child)
             toc.append((weight, title, description, child))
 
+    tmp_md_file_kwargs = {"mode": 'r+t', "encoding": 'UTF8', "delete": False, "dir": tmp_dir}
+
+    with tempfile.NamedTemporaryFile(**tmp_md_file_kwargs) as sep_file:
+        sec_sep_filepath = sep_file.name
+        sep_file.write(section_separator)
+
     # TOC
-    out_file.write(f'# Section {".".join(map(str, section_number))} "{this_title or str(dir_path)}"\n\n')
-    if this_description:
-        out_file.write(f'{this_description}\n\n')
+    with tempfile.NamedTemporaryFile(**tmp_md_file_kwargs) as header_file:
+        header_file.write(f'# Section {".".join(map(str, section_number))} "{this_title or dir_path.name}"\n\n')
+        if this_description:
+            header_file.write(f'{this_description}\n\n')
+        filepath_sequence += [header_file.name]
 
     toc.sort(key=lambda x: int(x[0] or 0))
     subdirs.sort(key=lambda x: int(x[0] or 0))
 
     if len(toc) > 0 or len(subdirs) > 0:
-        out_file.write('## Content\n\n')
-        for _, title, description, path in toc + subdirs:
-            out_file.write(f'* {title or str(path)} &mdash; {description or "subsection"}\n\n')
-        out_file.write(section_separator)
+        with tempfile.NamedTemporaryFile(**tmp_md_file_kwargs) as toc_file:
+            toc_file.write('## Content\n\n')
+            for _, title, description, path in toc + subdirs:
+                toc_file.write(f'* {title or str(path)} &mdash; {description or "subsection"}\n\n')
+            filepath_sequence += [toc_file.name, sec_sep_filepath]
 
     # Section content
+    # For unknown reasons, website's Markdown flavor uses '..' to point to the current directory.
+    # It creates problem for strict Markdown parsers.
+    # So I copy files and replace '..' with absolute file path in Markdown links.
+    md_broken_link_pat = re.compile(r'\[([^\]]+?)\]\(\.\./(.+?)\)')
+    md_replace_link_pat = f'[\g<1>]({dir_path}/\g<2>)'
     if len(toc) > 0:
         for _, title, description, md_file in toc:
-            out_file.write(f'# {title or str(md_file)}\n\n')
-            out_file.write(md_file.read_text(encoding='UTF8'))
-            out_file.write(section_separator)
+            print(f'processing file "{md_file.name}"')
+            with tempfile.NamedTemporaryFile(**tmp_md_file_kwargs) as title_file:
+                title_file.write(f'# {title or str(md_file)}\n\n')
+                filepath_sequence += [title_file.name]
+            with tempfile.NamedTemporaryFile(**tmp_md_file_kwargs) as trg_file:
+                trg_file.write(md_broken_link_pat.sub(md_replace_link_pat, md_file.read_text(encoding='UTF8')))
+                filepath_sequence += [trg_file.name]
+            filepath_sequence += [sec_sep_filepath]
 
     # Subsections content
     if len(subdirs) > 0:
         subsec_idx = 1
         for _, _, _, subdir_path in subdirs:
-            iterate_directory(subdir_path, out_file, (*section_number, subsec_idx), section_separator)
+            filepath_sequence += iterate_directory(subdir_path, tmp_dir, (*section_number, subsec_idx),
+                                                   section_separator)
             subsec_idx += 1
 
     # If no any content
     if len(toc) == 0 and len(subdirs) == 0:
-        out_file.write('No content.')
-        out_file.write(section_separator)
+        with tempfile.NamedTemporaryFile(**tmp_md_file_kwargs) as no_content_file:
+            no_content_file.write('No content.')
+            filepath_sequence += [no_content_file.name, sec_sep_filepath]
+
+    return filepath_sequence
 
 
 def __main__():
     orig_path = pathlib.Path(sys.argv[1])
     out_filepath = pathlib.Path(sys.argv[2])
-    assert orig_path.exists() and orig_path.is_dir()
+    assert orig_path.exists()
+    assert orig_path.is_dir()
+    assert '.pdf' == out_filepath.name[-4:]
 
-    with out_filepath.open(mode='w', encoding='UTF8') as out_file:
-        iterate_directory(orig_path, out_file, (1,), SECTION_SEPARATOR)
+    with tempfile.TemporaryDirectory() as out_tmp_dir:
+        # roll all md files into one
+        filepath_list = iterate_directory(orig_path, out_tmp_dir, (1,), SECTION_SEPARATOR)
+        # convert md to pdf
+        with tempfile.NamedTemporaryFile(mode='w+t', encoding='UTF8', delete=False, suffix='.html',
+                                         dir=out_tmp_dir) as html_file:
+            # with open('/tmp/bar/foo.html', mode='w+t', encoding='UTF8') as html_file:
+            html_filepath = html_file.name
+            # html_filepath = '/tmp/bar/foo.html'
+            print(f'Conversion to html "{html_filepath}"')
+            pypandoc.convert_file(filepath_list, 'html', format='md', outputfile=html_filepath,
+                                  extra_args=['--standalone'])
+        if html_filepath:
+            print(f'Conversion to pdf "{out_filepath}"')
+            os.system(f'pandoc "{html_filepath}" -o "{out_filepath}" --pdf-engine context')
+            # the line below doesn't work for unknown reasons
+            # pypandoc.convert_file(html_filepath, 'pdf', format='html', outputfile=out_filepath.name, extra_args=['--pdf-engine=context'])
+            print('Done')
 
 
 __main__()
